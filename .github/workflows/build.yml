@@ -86,7 +86,7 @@ jobs:
               target/alass-windows64.exe
 
     steps:
-      - name: Skip unselected platform
+      - name: Decide what this job runs
         id: selection
         shell: bash
         run: |
@@ -97,7 +97,15 @@ jobs:
             echo "'${{ matrix.name }}' was not selected - skipping"
           fi
 
-      - uses: actions/checkout@v4
+          # A release is published straight out of this run, so its binaries have to have
+          # aligned something first - the smoke test is not optional then.
+          if [ "${{ inputs.run_smoke_test }}" = "true" ] || [ -n "${{ inputs.release_tag }}" ]; then
+            echo "smoke=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "smoke=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
         if: steps.selection.outputs.selected == 'true'
 
       # the channel and the components come from rust-toolchain.toml
@@ -119,7 +127,7 @@ jobs:
 
       - name: Cache cargo registry and build directory
         if: steps.selection.outputs.selected == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -162,23 +170,41 @@ jobs:
           ./${{ matrix.binary }} --version
 
       - name: Install ffmpeg (Linux)
-        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test && startsWith(matrix.os, 'ubuntu')
+        if: steps.selection.outputs.selected == 'true' && steps.selection.outputs.smoke == 'true' && startsWith(matrix.os, 'ubuntu')
         run: |
+          if command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+            echo "ffmpeg is already on this image"
+            exit 0
+          fi
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
       - name: Install ffmpeg (macOS)
-        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test && startsWith(matrix.os, 'macos')
-        run: brew install ffmpeg
+        if: steps.selection.outputs.selected == 'true' && steps.selection.outputs.smoke == 'true' && startsWith(matrix.os, 'macos')
+        run: |
+          if command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+            echo "ffmpeg is already on this image"
+            exit 0
+          fi
+          # the runner image carries a tap Homebrew no longer trusts and warns about on
+          # every invocation; nothing here comes from it
+          brew untap aws/tap 2>/dev/null || true
+          brew install ffmpeg
 
       - name: Install ffmpeg (Windows)
-        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test && startsWith(matrix.os, 'windows')
-        run: choco install ffmpeg --no-progress -y
+        if: steps.selection.outputs.selected == 'true' && steps.selection.outputs.smoke == 'true' && startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          if command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null; then
+            echo "ffmpeg is already on this image"
+            exit 0
+          fi
+          choco install ffmpeg --no-progress -y
 
       # aligns a subtitle with a known offset, once against a reference subtitle
       # and once against a generated video file
       - name: Smoke test
-        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test
+        if: steps.selection.outputs.selected == 'true' && steps.selection.outputs.smoke == 'true'
         shell: bash
         env:
           ALASS_REQUIRE_VIDEO: "1"
@@ -186,7 +212,7 @@ jobs:
 
       - name: Upload binary
         if: steps.selection.outputs.selected == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: alass-${{ matrix.name }}
           path: ${{ matrix.artifacts }}
@@ -199,7 +225,7 @@ jobs:
     if: ${{ inputs.run_lints }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the declared minimum toolchain
         run: |
@@ -228,7 +254,7 @@ jobs:
             os: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -245,7 +271,7 @@ jobs:
         run: brew install ffmpeg pkg-config
 
       - name: Cache cargo registry and build directory
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -278,10 +304,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download the built binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 

@@ -150,7 +150,9 @@ The same four binaries are built by the `build` GitHub Actions workflow. It is t
 manually ("Run workflow" in the *Actions* tab, optionally for a single platform), runs
 `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and the smoke test on every
 platform, and uploads the binaries as workflow artifacts. Filling in its `release_tag` input
-additionally publishes them, with a `SHA256SUMS`, as a GitHub Release under that tag.
+additionally publishes them, with a `SHA256SUMS`, as a GitHub Release under that tag - and
+forces the smoke test on, whatever `run_smoke_test` says, so nothing is ever published that has
+not aligned a subtitle on the platform it was built for.
 
 ### Smoke test
 
