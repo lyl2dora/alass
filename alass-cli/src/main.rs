@@ -359,10 +359,10 @@ fn run() -> Result<i32, failure::Error> {
         // DEBUG MODE FOR REFERENCE FILE WAS ACTIVATED
         let ref_file = prepare_reference_file(&args)?;
 
-        println!("input file path was given as '_'");
-        println!("the output file is a .srt file only containing timing information from the reference file");
-        println!("this can be used as a debugging tool");
-        println!();
+        eprintln!("input file path was given as '_'");
+        eprintln!("the output file is a .srt file only containing timing information from the reference file");
+        eprintln!("this can be used as a debugging tool");
+        eprintln!();
 
         let lines: Vec<(subparse::timetypes::TimeSpan, String)> = ref_file
             .timespans()
@@ -541,12 +541,12 @@ fn run() -> Result<i32, failure::Error> {
     println!();
 
     if ref_file.timespans().is_empty() {
-        println!("warn: reference file has no subtitle lines");
-        println!();
+        eprintln!("warn: reference file has no subtitle lines");
+        eprintln!();
     }
     if inc_file.timespans().is_empty() {
-        println!("warn: file with incorrect subtitles has no lines");
-        println!();
+        eprintln!("warn: file with incorrect subtitles has no lines");
+        eprintln!();
     }
 
     fn scaled_timespan(ts: TimeSpan, fps_scaling_factor: f64) -> TimeSpan {
@@ -564,13 +564,13 @@ fn run() -> Result<i32, failure::Error> {
         .collect();
 
     if corrected_timespans.iter().any(|ts| ts.start.is_negative()) {
-        println!("warn: some subtitles now have negative timings, which can cause invalid subtitle files");
+        eprintln!("warn: some subtitles now have negative timings, which can cause invalid subtitle files");
         if args.allow_negative_timestamps {
-            println!(
+            eprintln!(
                 "warn: negative timestamps will be written to file, because you passed '-n' or '--allow-negative-timestamps'",
             );
         } else {
-            println!(
+            eprintln!(
                 "warn: negative subtitles will therefore moved to the start of the subtitle file by default; pass '-n' or '--allow-negative-timestamps' to disable this behavior",
             );
 
@@ -582,13 +582,13 @@ fn run() -> Result<i32, failure::Error> {
                 }
             }
         }
-        println!();
+        eprintln!();
     }
 
     // .idx only has start timepoints (the subtitle is shown until the next subtitle starts) - so retiming with gaps might
     // produce errors
     if output_file_format == SubtitleFormat::VobSubIdx {
-        println!("warn: writing to an '.idx' file can lead to unexpected results due to restrictions of this format");
+        eprintln!("warn: writing to an '.idx' file can lead to unexpected results due to restrictions of this format");
     }
 
     // incorrect file -> correct file
@@ -614,11 +614,11 @@ fn run() -> Result<i32, failure::Error> {
     // away" - so the caller is told through the exit code instead.
     if let Some(min_score) = args.min_score {
         if alignment_score < min_score {
-            println!(
+            eprintln!(
                 "warn: alignment score {:.3} is below the requested minimum of {:.3}",
                 alignment_score, min_score
             );
-            println!("warn: the output file was still written, so the result can be inspected");
+            eprintln!("warn: the output file was still written, so the result can be inspected");
             return Ok(2);
         }
     }

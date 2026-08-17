@@ -5,7 +5,7 @@ use pbr::ProgressBar;
 use std::cmp::{max, min};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::result::Result;
 
@@ -45,7 +45,7 @@ pub struct ProgressInfo {
     init_msg: Option<String>,
     prescaler: i64,
     counter: i64,
-    progress_bar: Option<ProgressBar<std::io::Stdout>>,
+    progress_bar: Option<ProgressBar<std::io::Stderr>>,
 }
 
 impl ProgressInfo {
@@ -61,22 +61,34 @@ impl ProgressInfo {
 
 impl ProgressInfo {
     fn init(&mut self, steps: i64) {
-        self.progress_bar = Some(ProgressBar::new((steps / self.prescaler) as u64));
+        // A progress bar redraws itself with carriage returns, which turns into
+        // thousands of junk lines once the output is a pipe or a log file - so it is
+        // only drawn for an interactive terminal. It also belongs on stderr, so that
+        // stdout carries nothing but the alignment report.
+        self.progress_bar = if std::io::stderr().is_terminal() {
+            Some(ProgressBar::on(std::io::stderr(), (steps / self.prescaler) as u64))
+        } else {
+            None
+        };
         if let Some(init_msg) = &self.init_msg {
-            println!("{}", init_msg);
+            eprintln!("{}", init_msg);
         }
     }
 
     fn inc(&mut self) {
         self.counter = self.counter + 1;
         if self.counter == self.prescaler {
-            self.progress_bar.as_mut().unwrap().inc();
+            if let Some(progress_bar) = self.progress_bar.as_mut() {
+                progress_bar.inc();
+            }
             self.counter = 0;
         }
     }
 
     fn finish(&mut self) {
-        self.progress_bar.as_mut().unwrap().finish_println("\n");
+        if let Some(progress_bar) = self.progress_bar.as_mut() {
+            progress_bar.finish_println("\n");
+        }
     }
 }
 
@@ -451,22 +463,22 @@ pub fn print_error_chain(error: failure::Error) {
         .map(|(_, value)| value);
     let show_bt = show_bt_opt != None && show_bt_opt != Some("0".to_string());
 
-    println!("error: {}", error);
+    eprintln!("error: {}", error);
     if show_bt {
-        println!("stack trace: {}", error.backtrace());
+        eprintln!("stack trace: {}", error.backtrace());
     }
 
     for cause in error.as_fail().iter_causes() {
-        println!("caused by: {}", cause);
+        eprintln!("caused by: {}", cause);
         if show_bt {
             if let Some(backtrace) = cause.backtrace() {
-                println!("stack trace: {}", backtrace);
+                eprintln!("stack trace: {}", backtrace);
             }
         }
     }
 
     if !show_bt {
-        println!("");
-        println!("not: run with environment variable 'RUST_BACKTRACE=1' for detailed stack traces");
+        eprintln!("");
+        eprintln!("not: run with environment variable 'RUST_BACKTRACE=1' for detailed stack traces");
     }
 }
