@@ -17,12 +17,10 @@
 
 use crate::rating_type::{Rating, RatingDelta, RatingDeltaDelta, RatingDeltaExt, RatingExt};
 use crate::segments::{
-    combined_maximum_of_dual_iterators, DifferentialRatingBufferBuilder, OffsetBuffer, RatingBuffer, RatingIterator,
-    RatingSegment, SeparateDualBuffer,
+    DifferentialRatingBufferBuilder, OffsetBuffer, RatingBuffer, RatingIterator, RatingSegment, SeparateDualBuffer,
+    combined_maximum_of_dual_iterators,
 };
 use crate::time_types::{TimeDelta, TimePoint, TimeSpan};
-
-use std::convert::TryInto;
 
 /// Use this trait if you want more detailed information about the progress of the align operation
 /// (which might take some seconds).
@@ -52,8 +50,8 @@ pub struct Aligner;
 
 impl Aligner {
     pub fn get_offsets_bounds(ref_spans: &[TimeSpan], in_spans: &[TimeSpan]) -> (TimeDelta, TimeDelta) {
-        assert!(ref_spans.len() > 0);
-        assert!(in_spans.len() > 0);
+        assert!(!ref_spans.is_empty());
+        assert!(!in_spans.is_empty());
 
         let in_start: TimePoint = (*in_spans.first().unwrap()).start();
         let in_end: TimePoint = (*in_spans.last().unwrap()).end();
@@ -88,8 +86,8 @@ impl Aligner {
                 #[inline(always)]
                 fn accum(d: &mut [RatingDeltaDelta], idx: TimeDelta, x: RatingDeltaDelta, sigma_min: TimeDelta) {
                     let idx: usize = (idx - sigma_min).as_i64().try_into().unwrap();
-                    d[idx] = d[idx] + x;
-                };
+                    d[idx] += x;
+                }
 
                 accum(
                     &mut deltas,
@@ -149,7 +147,7 @@ impl Aligner {
 
         assert!(Rating::is_zero(rating));
 
-        return (maximum.1, maximum.0);
+        (maximum.1, maximum.0)
     }
 
     pub fn align_constant_delta(
@@ -182,10 +180,7 @@ impl Aligner {
 
         impl DeltaCorrect {
             fn new(rating: RatingDeltaDelta, time: TimeDelta) -> DeltaCorrect {
-                DeltaCorrect {
-                    rating: rating,
-                    time: time,
-                }
+                DeltaCorrect { rating, time }
             }
         }
 
@@ -200,22 +195,21 @@ impl Aligner {
             let mut down_ordered_delta_corrects: OrderedDeltaCorrect = OrderedDeltaCorrect::new();
 
             for reference_ts in ref_spans {
-                let rise_time;
-                let up_time;
-                let fall_time;
-                let down_time;
-
-                if incorrect_ts.len() < reference_ts.len() {
-                    rise_time = reference_ts.start() - incorrect_ts.len();
-                    up_time = reference_ts.start();
-                    fall_time = reference_ts.end() - incorrect_ts.len();
-                    down_time = reference_ts.end();
+                let (rise_time, up_time, fall_time, down_time) = if incorrect_ts.len() < reference_ts.len() {
+                    (
+                        reference_ts.start() - incorrect_ts.len(),
+                        reference_ts.start(),
+                        reference_ts.end() - incorrect_ts.len(),
+                        reference_ts.end(),
+                    )
                 } else {
-                    rise_time = reference_ts.start() - incorrect_ts.len();
-                    up_time = reference_ts.end() - incorrect_ts.len();
-                    fall_time = reference_ts.start();
-                    down_time = reference_ts.end();
-                }
+                    (
+                        reference_ts.start() - incorrect_ts.len(),
+                        reference_ts.end() - incorrect_ts.len(),
+                        reference_ts.start(),
+                        reference_ts.end(),
+                    )
+                };
 
                 let rating_delta_delta: RatingDeltaDelta =
                     RatingDelta::compute_rating_delta(incorrect_ts.len(), reference_ts.len(), score_fn);
@@ -253,7 +247,7 @@ impl Aligner {
 
         #[cfg(not(feature = "nosplit-heap-sort"))]
         {
-            all_delta_corrects = delta_corrects.into_iter().flat_map(|dc| dc).collect();
+            all_delta_corrects = delta_corrects.into_iter().flatten().collect();
             all_delta_corrects.sort_unstable_by_key(|dc| dc.time);
 
             first_delta_correct = all_delta_corrects
@@ -269,12 +263,13 @@ impl Aligner {
             use std::cmp::Ordering;
             use std::collections::BinaryHeap;
 
-            #[derive(PartialEq, Eq)]
             struct MaxHeapInfo {
                 heap_id: usize,
                 data: DeltaCorrect,
             }
 
+            // The heap only ever orders by time; equality has to agree with `cmp` for the
+            // `Ord`/`Eq` contract to hold, so both are derived from the time alone.
             impl Ord for MaxHeapInfo {
                 fn cmp(&self, other: &MaxHeapInfo) -> Ordering {
                     TimeDelta::cmp(&self.data.time, &other.data.time)
@@ -287,6 +282,14 @@ impl Aligner {
                 }
             }
 
+            impl PartialEq for MaxHeapInfo {
+                fn eq(&self, other: &MaxHeapInfo) -> bool {
+                    self.data.time == other.data.time
+                }
+            }
+
+            impl Eq for MaxHeapInfo {}
+
             let mut heap = BinaryHeap::new();
 
             for (heap_id, data) in delta_corrects.iter_mut().enumerate() {
@@ -294,23 +297,15 @@ impl Aligner {
                     .pop()
                     .expect("at least one element should be in every delta correct list");
                 heap.push(MaxHeapInfo {
-                    heap_id: heap_id,
+                    heap_id,
                     data: last_elem,
                 });
             }
 
-            all_delta_corrects = Vec::with_capacity(4 * self.list.len() * self.reference.len());
+            all_delta_corrects = Vec::with_capacity(4 * in_spans.len() * ref_spans.len());
 
-            loop {
-                let max_heap_elem: MaxHeapInfo;
-
-                match heap.pop() {
-                    Some(x) => max_heap_elem = x,
-
-                    // are all vectors empty?
-                    None => break,
-                }
-
+            // are all vectors empty? -> the heap runs dry and the loop ends
+            while let Some(max_heap_elem) = heap.pop() {
                 all_delta_corrects.push(max_heap_elem.data);
 
                 if let Some(new_delta_correct) = delta_corrects[max_heap_elem.heap_id].pop() {
@@ -321,7 +316,7 @@ impl Aligner {
                 }
             }
 
-            assert!(all_delta_corrects.len() == 4 * self.list.len() * self.reference.len());
+            assert!(all_delta_corrects.len() == 4 * in_spans.len() * ref_spans.len());
             sorted_delta_corrects_iter = all_delta_corrects.iter().rev();
 
             first_delta_correct = all_delta_corrects
@@ -339,7 +334,7 @@ impl Aligner {
             .zip(sorted_delta_corrects_iter.skip(1))
         {
             //println!("rating: {}", rating);
-            delta = delta + delta_correct.rating;
+            delta += delta_correct.rating;
             rating = Rating::add_mul(rating, delta, next_delta_correct.time - delta_correct.time);
             if rating > maximum.0 {
                 maximum = (rating, next_delta_correct.time);
@@ -348,14 +343,7 @@ impl Aligner {
 
         assert!(Rating::is_zero(rating));
 
-        return (maximum.1, maximum.0);
-    }
-
-    #[cfg(feature = "statistics")]
-    pub fn do_statistics(&self, f: impl Fn(&mut Statistics) -> std::io::Result<()>) {
-        if let Some(statistics) = &self.statistics {
-            f(&mut statistics.borrow_mut()).expect("failed to write statistics");
-        }
+        (maximum.1, maximum.0)
     }
 
     pub fn align_with_splits(
@@ -372,8 +360,8 @@ impl Aligner {
         // values between `[0, max_rating]` are interesting) we multiply by
         // `min(list.len(), reference.len())`.
 
-        assert!(in_spans.len() > 0);
-        assert!(ref_spans.len() > 0);
+        assert!(!in_spans.is_empty());
+        assert!(!ref_spans.is_empty());
 
         progress_handler.init(in_spans.len() as i64);
 
@@ -455,8 +443,7 @@ impl Aligner {
 
         let (total_rating, mut span_offset) = culmulative_rating_buffer.maximum();
 
-        let mut result_deltas = Vec::new();
-        result_deltas.push(span_offset);
+        let mut result_deltas = vec![span_offset];
 
         //let sum: usize = offset_buffers.iter().map(|ob| ob.len()).sum();
         //println!("{} {}MB", sum, (sum * std::mem::size_of::<crate::segments::OffsetSegment>()) as f64 / (1024 * 1024) as f64);
@@ -495,14 +482,13 @@ impl Aligner {
     ///
     /// This function has O(n) runtime, where n is the number of spans in the
     /// reference list.
-
-    fn single_span_ratings(
+    fn single_span_ratings<T: Fn(TimeDelta, TimeDelta) -> f64 + Copy>(
         ref_spans: &[TimeSpan],
         in_span: TimeSpan,
-        score_fn: impl Fn(TimeDelta, TimeDelta) -> f64 + Copy,
+        score_fn: T,
         min_offset: TimeDelta,
         max_offset: TimeDelta,
-    ) -> RatingIterator<impl Iterator<Item = RatingSegment>> {
+    ) -> RatingIterator<impl Iterator<Item = RatingSegment> + use<T>> {
         // If we fix one timespan and let an other timespan variable, we get such a
         // curve for the rating:
         //
@@ -553,23 +539,23 @@ impl Aligner {
                 if bi == b.len() {
                     while ai < a.len() {
                         result.push(a[ai]);
-                        ai = ai + 1;
+                        ai += 1;
                     }
                     return result;
                 }
                 if ai == a.len() {
                     while bi < b.len() {
                         result.push(b[bi]);
-                        bi = bi + 1;
+                        bi += 1;
                     }
                     return result;
                 }
                 if a[ai].0 <= b[bi].0 {
                     result.push(a[ai]);
-                    ai = ai + 1;
+                    ai += 1;
                 } else {
                     result.push(b[bi]);
-                    bi = bi + 1;
+                    bi += 1;
                 }
             }
         }
@@ -605,6 +591,8 @@ mod tests {
     use crate::rating_type::RatingExt;
     use crate::segments::RatingFullSegment;
     use crate::tests::get_random_prepared_test_time_spans;
+    use crate::timespan_ops::prepare_time_spans;
+    use rand::RngExt;
 
     fn get_dummy_spans() -> Vec<TimeSpan> {
         loop {
@@ -654,6 +642,94 @@ mod tests {
                 assert!(Rating::is_zero(last.end_rating()));
                 //assert_eq!(dbg!(last.data.delta), RatingDelta::zero());
             }
+        }
+    }
+
+    /// A handful of short, non-overlapping, non-zero-length spans - small enough that a
+    /// brute-force sweep over every candidate offset stays cheap.
+    fn get_small_dummy_spans(rng: &mut impl RngExt) -> Vec<TimeSpan> {
+        loop {
+            let len: usize = rng.random_range(1..6);
+            let spans: Vec<TimeSpan> = (0..len)
+                .map(|_| {
+                    let start: i64 = rng.random_range(0..40);
+                    let span_len: i64 = rng.random_range(1..10);
+                    TimeSpan::new(TimePoint::from(start), TimePoint::from(start + span_len))
+                })
+                .collect();
+
+            let prepared = prepare_time_spans(&spans).0;
+            if !prepared.is_empty() {
+                return prepared;
+            }
+        }
+    }
+
+    /// Independent O(range * n * m) reference implementation of the constant-delta
+    /// alignment: for every candidate offset it sums `rating_delta * overlap_length`
+    /// over all reference/incorrect span pairs and keeps the first strict maximum.
+    fn brute_force_constant_delta(ref_spans: &[TimeSpan], in_spans: &[TimeSpan]) -> (TimeDelta, Rating) {
+        let (min_offset, max_offset) = Aligner::get_offsets_bounds(ref_spans, in_spans);
+
+        let mut best: (Rating, TimeDelta) = (Rating::zero(), min_offset);
+        let mut offset = min_offset;
+        while offset <= max_offset {
+            let mut rating = Rating::zero();
+            for &reference_ts in ref_spans {
+                for &incorrect_ts in in_spans {
+                    let rating_delta_delta = RatingDelta::compute_rating_delta(
+                        incorrect_ts.len(),
+                        reference_ts.len(),
+                        crate::standard_scoring,
+                    );
+                    let overlap = TimeSpan::get_overlapping_length(reference_ts, incorrect_ts + offset);
+                    rating = Rating::add_mul(rating, rating_delta_delta, overlap);
+                }
+            }
+
+            if rating > best.0 {
+                best = (rating, offset);
+            }
+
+            offset += TimeDelta::one();
+        }
+
+        (best.1, best.0)
+    }
+
+    #[test]
+    /// `align_constant_delta_merge_sort` is the sweep used when the offset range is
+    /// sparse; with the `nosplit-heap-sort` feature enabled it sorts the change points
+    /// with a k-way heap merge instead of a single `sort_unstable_by_key`. Both variants
+    /// must agree with the dense bucket sweep and with the brute-force reference.
+    fn align_constant_delta_implementations_agree() {
+        let mut rng = rand::rng();
+
+        for _ in 0..200 {
+            let ref_spans = get_small_dummy_spans(&mut rng);
+            let in_spans = get_small_dummy_spans(&mut rng);
+
+            let expected = brute_force_constant_delta(&ref_spans, &in_spans);
+
+            let bucket_sort = Aligner::align_constant_delta_bucket_sort(&ref_spans, &in_spans, crate::standard_scoring);
+            let merge_sort = Aligner::align_constant_delta_merge_sort(&ref_spans, &in_spans, crate::standard_scoring);
+
+            assert_eq!(bucket_sort, expected, "ref: {ref_spans:?} in: {in_spans:?}");
+            assert_eq!(merge_sort, expected, "ref: {ref_spans:?} in: {in_spans:?}");
+        }
+    }
+
+    #[test]
+    /// The same cross-check on the full-size random span lists the other tests use.
+    /// Brute force is too slow at that size, so the dense bucket sweep is the reference.
+    fn align_constant_delta_implementations_agree_on_large_input() {
+        for _ in 0..30 {
+            let (ref_spans, in_spans) = (get_dummy_spans(), get_dummy_spans());
+
+            let bucket_sort = Aligner::align_constant_delta_bucket_sort(&ref_spans, &in_spans, crate::standard_scoring);
+            let merge_sort = Aligner::align_constant_delta_merge_sort(&ref_spans, &in_spans, crate::standard_scoring);
+
+            assert_eq!(bucket_sort, merge_sort);
         }
     }
 

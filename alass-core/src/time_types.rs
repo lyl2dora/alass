@@ -15,8 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std;
-use std::cmp::{max, min, Ordering};
+use std::cmp::{Ordering, max, min};
 use std::ops::*;
 
 /// Implements conversion to integer variables for TimeDelta and TimePoint.
@@ -63,7 +62,7 @@ impl TimeDelta {
 
     /// Return time difference as i64.
     pub fn as_i64(&self) -> i64 {
-        self.0 as i64
+        self.0
     }
 }
 
@@ -186,7 +185,7 @@ impl TimePoint {
 
     /// Returns a i64 for the given time point.
     pub fn as_i64(self) -> i64 {
-        self.0 as i64
+        self.0
     }
 }
 
@@ -276,7 +275,7 @@ impl TimeSpan {
     #[inline]
     pub fn new(start: TimePoint, end: TimePoint) -> TimeSpan {
         assert!(start <= end);
-        TimeSpan { start: start, end: end }
+        TimeSpan { start, end }
     }
 
     /// Create a new TimeSpan with `start` and `end`. This function will not

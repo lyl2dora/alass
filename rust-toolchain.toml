@@ -1,0 +1,7 @@
+# Honoured by rustup (i.e. by CI); a plain cargo install ignores it.
+# `stable` rather than a pinned version: the workspace states its real floor with
+# `rust-version = "1.88"` in Cargo.toml, and the resolver keeps that honest.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -4,18 +4,20 @@ This Rust library contains the core algorithm for `alass`, the "Automatic Langua
 
 
 ## How to use the library
-Add this to your `Cargo.toml`:
+
+This fork is not published, so depend on it by path or by git:
 
 ```toml
 [dependencies]
-alass-core = "2.0.0"
+alass-core = { git = "https://github.com/kaegi/alass" }
 ```
 
-The library only contains one function that takes two sequences of time spans and returns the offsets to get the best possible alignment.
+The two entry points take two sequences of time spans and return the offset for each span of the
+second sequence: `align` finds the best alignment allowing breaks, `align_nosplit` shifts
+everything by a single offset. `get_nosplit_score` rates a result, and `standard_scoring` /
+`overlap_scoring` are the two scoring functions to hand them.
 
-[Documentation](https://docs.rs/alass-core)
-
-[Crates.io](https://crates.io/crates/alass-core)
+The [2019 release on crates.io](https://crates.io/crates/alass-core) predates this fork.
 
 ### Documentaion
 

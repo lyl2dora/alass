@@ -1,25 +1,35 @@
+#[cfg(not(any(feature = "ffmpeg-binary", feature = "ffmpeg-library")))]
+compile_error!("alass-cli needs an audio backend: enable `ffmpeg-binary` (the default) or `ffmpeg-library`");
+
+// The two backends are alternatives, and `ffmpeg-library` wins when both are on. Features are
+// additive in cargo, so refusing the combination would break `--all-features` for every tool
+// that uses it.
 #[cfg(feature = "ffmpeg-library")]
 mod ffmpeg_library;
 
 #[cfg(feature = "ffmpeg-library")]
-pub use ffmpeg_library::VideoDecoderFFmpegLibrary as VideoDecoder;
+pub use ffmpeg_library::{DecoderError, VideoDecoderFFmpegLibrary as VideoDecoder};
 
-#[cfg(feature = "ffmpeg-binary")]
+#[cfg(all(feature = "ffmpeg-binary", not(feature = "ffmpeg-library")))]
 mod ffmpeg_binary;
 
-#[cfg(feature = "ffmpeg-binary")]
-pub use ffmpeg_binary::VideoDecoderFFmpegBinary as VideoDecoder;
+#[cfg(all(feature = "ffmpeg-binary", not(feature = "ffmpeg-library")))]
+pub use ffmpeg_binary::{DecoderError, VideoDecoderFFmpegBinary as VideoDecoder};
 
+/// Receives the audio samples a [`VideoDecoder`] reads out of a video file.
 pub trait AudioReceiver {
     type Output;
-    type Error: failure::Fail;
+    type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Samples are in 8000kHz mono/single-channel format.
+    /// Samples are in 8000Hz mono/single-channel format.
     fn push_samples(&mut self, samples: &[i16]) -> Result<(), Self::Error>;
 
     fn finish(self) -> Result<Self::Output, Self::Error>;
 }
 
+/// Hands the samples on in fixed-size chunks, because the voice activity detector
+/// only accepts exactly 10ms of audio at a time.
+#[derive(Debug)]
 pub struct ChunkedAudioReceiver<R: AudioReceiver> {
     buffer: Vec<i16>,
     filled: usize,
@@ -29,7 +39,7 @@ pub struct ChunkedAudioReceiver<R: AudioReceiver> {
 impl<R: AudioReceiver> ChunkedAudioReceiver<R> {
     pub fn new(size: usize, next: R) -> ChunkedAudioReceiver<R> {
         ChunkedAudioReceiver {
-            buffer: std::vec::from_elem(0, size),
+            buffer: vec![0; size],
             filled: 0,
             next,
         }
@@ -43,17 +53,12 @@ impl<R: AudioReceiver> AudioReceiver for ChunkedAudioReceiver<R> {
     fn push_samples(&mut self, mut samples: &[i16]) -> Result<(), R::Error> {
         assert!(self.buffer.len() > self.filled);
 
-        loop {
-            if samples.is_empty() {
-                break;
-            }
-
+        while !samples.is_empty() {
             let sample_count = std::cmp::min(self.buffer.len() - self.filled, samples.len());
-            self.buffer[self.filled..self.filled + sample_count].clone_from_slice(&samples[..sample_count]);
+            self.buffer[self.filled..self.filled + sample_count].copy_from_slice(&samples[..sample_count]);
 
             samples = &samples[sample_count..];
-
-            self.filled = self.filled + sample_count;
+            self.filled += sample_count;
 
             if self.filled == self.buffer.len() {
                 self.next.push_samples(self.buffer.as_slice())?;
@@ -76,8 +81,9 @@ pub trait ProgressHandler {
     ///
     /// The number of steps is around the number of lines in the "incorrect" subtitle.
     /// Be aware that this number can be zero!
-    #[allow(unused_variables)]
-    fn init(&mut self, steps: i64) {}
+    fn init(&mut self, steps: i64) {
+        let _ = steps;
+    }
 
     /// We made (small) progress!
     fn inc(&mut self) {}
@@ -85,6 +91,3 @@ pub trait ProgressHandler {
     /// Will be called after the last `inc()`, when `inc()` was called `steps` times.
     fn finish(&mut self) {}
 }
-
-/*struct NoProgressHandler {}
-impl ProgressHandler for NoProgressHandler {}*/

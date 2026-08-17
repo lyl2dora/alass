@@ -1,0 +1,325 @@
+name: build
+
+# manual trigger only
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Which platform to build"
+        type: choice
+        default: all
+        options:
+          - all
+          - linux-x86_64
+          - linux-arm64
+          - macos-arm64
+          - windows-x86_64
+      run_tests:
+        description: "Run `cargo test`"
+        type: boolean
+        default: true
+      run_smoke_test:
+        description: "Run the end-to-end smoke test (installs ffmpeg)"
+        type: boolean
+        default: true
+      run_lints:
+        description: "Run `cargo fmt --check` and `cargo clippy -D warnings`"
+        type: boolean
+        default: true
+      ffmpeg_library:
+        description: "Also build the non-default `ffmpeg-library` feature (needs FFmpeg dev packages)"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Publish the binaries as a GitHub Release under this tag (e.g. v3.0.0); empty = artifacts only"
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # statically linked against musl, so the binary runs on any distribution
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            make_target: package_linux64
+            binary: target/alass-linux64
+            artifacts: |
+              target/alass-linux64
+
+          # `ubuntu-*-arm` runners are free for public repositories; on a private
+          # repository they have to be enabled in the repository settings
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            make_target: package_linux_arm64
+            binary: target/alass-linux-arm64
+            artifacts: |
+              target/alass-linux-arm64
+
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            make_target: package_macos
+            binary: target/alass-macos-arm64
+            artifacts: |
+              target/alass-macos-arm64
+              target/alass-macos-arm64.tar.gz
+
+          # no `make` target: Windows needs no packaging beyond the plain binary,
+          # which the step below builds with cargo directly
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            make_target: ""
+            binary: target/alass-windows64.exe
+            artifacts: |
+              target/alass-windows64.exe
+
+    steps:
+      - name: Skip unselected platform
+        id: selection
+        shell: bash
+        run: |
+          if [ "${{ inputs.platform }}" = "all" ] || [ "${{ inputs.platform }}" = "${{ matrix.name }}" ]; then
+            echo "selected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "selected=false" >> "$GITHUB_OUTPUT"
+            echo "'${{ matrix.name }}' was not selected - skipping"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.selection.outputs.selected == 'true'
+
+      # the channel and the components come from rust-toolchain.toml
+      - name: Install Rust toolchain
+        if: steps.selection.outputs.selected == 'true'
+        shell: bash
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
+
+      # `musl-gcc` is needed to compile the C sources of the voice activity detector
+      - name: Install musl toolchain
+        if: steps.selection.outputs.selected == 'true' && startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry and build directory
+        if: steps.selection.outputs.selected == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.name }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.name }}-cargo-
+
+      - name: Check formatting
+        if: steps.selection.outputs.selected == 'true' && inputs.run_lints
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: steps.selection.outputs.selected == 'true' && inputs.run_lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # tests run against the host target: the `rand` dev-dependency reaches for
+      # `getrandom`, which is happier linked dynamically, and the musl targets below
+      # are only about the shipped binary
+      - name: Run tests
+        if: steps.selection.outputs.selected == 'true' && inputs.run_tests
+        run: cargo test --workspace --release
+
+      - name: Build and package
+        if: steps.selection.outputs.selected == 'true' && matrix.make_target != ''
+        run: make ${{ matrix.make_target }}
+
+      - name: Build (Windows)
+        if: steps.selection.outputs.selected == 'true' && matrix.make_target == ''
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          cp ./target/${{ matrix.target }}/release/alass-cli.exe ./${{ matrix.binary }}
+
+      - name: Check the binary
+        if: steps.selection.outputs.selected == 'true'
+        shell: bash
+        run: |
+          ls -l ${{ matrix.binary }}
+          ./${{ matrix.binary }} --version
+
+      - name: Install ffmpeg (Linux)
+        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test && startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test && startsWith(matrix.os, 'macos')
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test && startsWith(matrix.os, 'windows')
+        run: choco install ffmpeg --no-progress -y
+
+      # aligns a subtitle with a known offset, once against a reference subtitle
+      # and once against a generated video file
+      - name: Smoke test
+        if: steps.selection.outputs.selected == 'true' && inputs.run_smoke_test
+        shell: bash
+        env:
+          ALASS_REQUIRE_VIDEO: "1"
+        run: ./scripts/smoke-test.sh ${{ matrix.binary }}
+
+      - name: Upload binary
+        if: steps.selection.outputs.selected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: alass-${{ matrix.name }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+
+  # Proves the `rust-version` in Cargo.toml is the truth and not an aspiration.
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run_lints }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the declared minimum toolchain
+        run: |
+          msrv=$(python3 -c 'import re; print(re.search(r"^rust-version = \"([^\"]+)\"", open("Cargo.toml").read(), re.M).group(1))')
+          echo "msrv=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+
+      - name: Check
+        run: cargo +${{ env.msrv }} check --workspace --all-targets
+
+  # The non-default `ffmpeg-library` feature links against the FFmpeg libraries instead of
+  # spawning the executables. It needs the FFmpeg development packages at build time, so it
+  # is not part of the shipped binaries - this job only keeps it from rotting.
+  ffmpeg-library:
+    name: ffmpeg-library feature (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    if: ${{ inputs.ffmpeg_library }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: macos-arm64
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install FFmpeg development libraries (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg pkg-config clang \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev libswresample-dev libswscale-dev
+
+      - name: Install FFmpeg development libraries (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: brew install ffmpeg pkg-config
+
+      - name: Cache cargo registry and build directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.name }}-ffmpeg-library-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.name }}-ffmpeg-library-
+
+      - name: Build
+        run: cargo build --release -p alass-cli --no-default-features --features ffmpeg-library
+
+      - name: Clippy
+        if: ${{ inputs.run_lints }}
+        run: cargo clippy --release -p alass-cli --no-default-features --features ffmpeg-library -- -D warnings
+
+      - name: Smoke test
+        env:
+          ALASS_REQUIRE_VIDEO: "1"
+        run: ./scripts/smoke-test.sh target/release/alass-cli
+
+  # Publishes what `build` produced. Only runs when a tag was given, and only for a full
+  # `platform: all` run - a release missing three of its four binaries is worse than none.
+  release:
+    name: publish release ${{ inputs.release_tag }}
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ inputs.release_tag != '' && inputs.platform == 'all' }}
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect the release files
+        run: |
+          mkdir release
+          cp artifacts/alass-linux-x86_64/alass-linux64            release/
+          cp artifacts/alass-linux-arm64/alass-linux-arm64         release/
+          cp artifacts/alass-macos-arm64/alass-macos-arm64.tar.gz  release/
+          cp artifacts/alass-windows-x86_64/alass-windows64.exe    release/
+          chmod +x release/alass-linux64 release/alass-linux-arm64
+          ls -l release
+          ( cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(python3 -c 'import re; print(re.search(r"^version = \"([^\"]+)\"", open("Cargo.toml").read(), re.M).group(1))')"
+          notes=$(cat <<EOF
+          Built from \`${GITHUB_SHA}\` by the \`build\` workflow (workspace version \`${version}\`).
+
+          | File | Platform |
+          | --- | --- |
+          | \`alass-windows64.exe\` | Windows x86-64 |
+          | \`alass-linux64\` | Linux x86-64, statically linked against musl |
+          | \`alass-linux-arm64\` | Linux ARM64, statically linked against musl |
+          | \`alass-macos-arm64.tar.gz\` | macOS Apple Silicon |
+
+          \`ffmpeg\` and \`ffprobe\` have to be installed to read video files. The macOS binary is
+          not notarized, so remove the quarantine flag once after extracting:
+          \`xattr -d com.apple.quarantine alass\`.
+
+          \`SHA256SUMS\` covers every file in this release.
+          EOF
+          )
+          gh release create "${{ inputs.release_tag }}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "${{ inputs.release_tag }}" \
+            --notes "$notes"

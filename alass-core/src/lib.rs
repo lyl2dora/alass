@@ -15,26 +15,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#![deny(
-    //missing_docs,
-    missing_debug_implementations,
-    //missing_copy_implementations,
-    trivial_casts,
-    //unsafe_code,
-    unstable_features,
-    unused_import_braces,
-    unused_qualifications
-)]
-#![allow(unknown_lints)] // for clippy
+// `missing_debug_implementations`, `trivial_casts`, `unused_import_braces` and
+// `unused_qualifications` are configured in `[workspace.lints.rust]`.
+#![deny(unstable_features)]
 
 //! `alass` takes two timespan arrays (e.g. from two subtitle files) and
 //! tries to align the `incorrect` subtitles
 //! to the `reference` subtitle. It automatically fixes offsets and
 //! introduces/removes breaks between subtitles in the `incorrect`
 //! subtitle to achive the best alignment.
-
-#[cfg(test)]
-extern crate rand;
 
 mod alass;
 mod rating_type;
@@ -98,7 +87,7 @@ pub fn align_nosplit(
     progress_handler.inc();
     progress_handler.finish();
 
-    return (delta, score.as_readable_f64());
+    (delta, score.as_readable_f64())
 }
 
 /// Matches an `incorrect` subtitle list to a `reference` subtitle list.
@@ -128,8 +117,8 @@ pub fn align(
     score_fn: impl Fn(TimeDelta, TimeDelta) -> f64 + Copy,
     progress_handler: impl ProgressHandler,
 ) -> (Vec<TimeDelta>, f64) {
-    let (list_nonoverlapping, list_indices) = prepare_time_spans(&list);
-    let (ref_nonoverlapping, _) = prepare_time_spans(&reference);
+    let (list_nonoverlapping, list_indices) = prepare_time_spans(list);
+    let (ref_nonoverlapping, _) = prepare_time_spans(reference);
 
     if list_nonoverlapping.is_empty() || ref_nonoverlapping.is_empty() {
         return (vec![TimeDelta::zero(); list.len()], 0.);
@@ -196,37 +185,27 @@ fn get_nosplit_rating_iter(
 ) -> Rating {
     let mut total_rating = Rating::zero();
 
-    let mut ref_span;
-    let mut in_span;
-
-    let ref_span_opt = ref_spans.next();
-    match ref_span_opt {
-        None => return total_rating,
-        Some(v) => ref_span = v,
-    }
-
-    let in_span_opt = in_spans.next();
-    match in_span_opt {
-        None => return total_rating,
-        Some(v) => in_span = v,
-    }
+    let Some(mut ref_span) = ref_spans.next() else {
+        return total_rating;
+    };
+    let Some(mut in_span) = in_spans.next() else {
+        return total_rating;
+    };
 
     loop {
         let rating = Rating::from_timespans(ref_span, in_span, score_fn);
         total_rating += rating;
 
         if ref_span.end() <= in_span.end() {
-            let ref_span_opt = ref_spans.next();
-            match ref_span_opt {
-                None => return total_rating,
-                Some(v) => ref_span = v,
-            }
+            let Some(next_ref_span) = ref_spans.next() else {
+                return total_rating;
+            };
+            ref_span = next_ref_span;
         } else {
-            let in_span_opt = in_spans.next();
-            match in_span_opt {
-                None => return total_rating,
-                Some(v) => in_span = v,
-            }
+            let Some(next_in_span) = in_spans.next() else {
+                return total_rating;
+            };
+            in_span = next_in_span;
         }
     }
 }
@@ -234,9 +213,7 @@ fn get_nosplit_rating_iter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{prepare_time_spans, TimePoint};
-    use rand;
-    use rand::RngCore;
+    use rand::RngExt;
 
     /// Some special time span sequences.
     fn predefined_time_spans() -> Vec<Vec<TimeSpan>> {
@@ -259,14 +236,14 @@ mod tests {
 
     /// Generate random time span sequences
     fn generate_random_time_spans() -> Vec<TimeSpan> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
-        let len: usize = (rng.next_u32() % 400) as usize;
+        let len: usize = rng.random_range(0..400);
         let mut v = Vec::with_capacity(len);
         let mut current_pos = 0i64;
         for _ in 0..len {
-            current_pos += (rng.next_u32() % 200) as i64 - 50;
-            let current_len = (rng.next_u32() % 400) as i64;
+            current_pos += rng.random_range(-50i64..150);
+            let current_len: i64 = rng.random_range(0..400);
             v.push(TimeSpan::new(
                 TimePoint::from(current_pos),
                 TimePoint::from(current_pos + current_len),
@@ -280,7 +257,7 @@ mod tests {
     pub fn get_test_time_spans() -> Vec<Vec<TimeSpan>> {
         (0..1000)
             .map(|_| generate_random_time_spans())
-            .chain(predefined_time_spans().into_iter())
+            .chain(predefined_time_spans())
             .collect()
     }
 

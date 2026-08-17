@@ -1,6 +1,7 @@
 target
 .*
 !.gitignore
+!.github
 *.ass
 *.srt
 *.svg

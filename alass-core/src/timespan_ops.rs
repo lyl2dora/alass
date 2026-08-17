@@ -16,7 +16,6 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{TimeDelta, TimeSpan};
-use std;
 use std::cmp::max;
 
 fn prepare_spans_sorted(overlapping: &[TimeSpan]) -> (Vec<TimeSpan>, Vec<usize>) {
@@ -31,7 +30,7 @@ fn prepare_spans_sorted(overlapping: &[TimeSpan]) -> (Vec<TimeSpan>, Vec<usize>)
     sorted_overlapping.sort_by(|a, b| TimeSpan::cmp_start(a.1, b.1));
 
     // create a mapping from "original vector index -> sorted vector index"
-    let mut mapping = std::vec::from_elem(0usize, overlapping.len());
+    let mut mapping = vec![0usize; overlapping.len()];
     for (i2, &(i, _)) in sorted_overlapping.iter().enumerate() {
         mapping[i] = i2;
     }
@@ -158,20 +157,16 @@ mod tests {
 
             // function will condense non-zero timespans into one -> vector of zero-length
             // timespans will turn into empty vector
-            let full_length: i64 = time_spans
-                .iter()
-                .cloned()
-                .map(|time_spans| i64::from(time_spans.len()))
-                .sum();
+            let full_length: i64 = time_spans.iter().map(|time_span| i64::from(time_span.len())).sum();
             if full_length == 0 {
                 assert!(non_overlapping.is_empty());
                 continue;
             }
 
-            if time_spans.len() == 0 {
+            if time_spans.is_empty() {
                 continue;
             }
-            assert!(non_overlapping.len() > 0);
+            assert!(!non_overlapping.is_empty());
 
             // test whether some spans overlap (they shouldn't)
             non_overlapping

@@ -1,16 +1,15 @@
-use failure::{Backtrace, Context, Fail, ResultExt};
+//! Reads the audio out of a video file by driving the `ffmpeg`/`ffprobe` executables.
+//!
+//! `ffprobe` reports the streams and the duration, then `ffmpeg` is asked for the
+//! smallest audio stream as raw 8kHz mono 16-bit samples on stdout.
+
+use serde::{Deserialize, Deserializer};
 use std::ffi::OsString;
-use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Child;
-use std::process::{ChildStdout, Command, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::str::from_utf8;
-
-use byteorder::ByteOrder;
-use serde::{Deserialize, Deserializer};
-
-use crate::define_error;
+use thiserror::Error;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecType {
@@ -23,28 +22,27 @@ pub enum CodecType {
 impl<'de> Deserialize<'de> for CodecType {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        match &s[..] {
-            "audio" => Ok(CodecType::Audio),
-            "video" => Ok(CodecType::Video),
-            "subtitle" => Ok(CodecType::Subtitle),
-            s => Ok(CodecType::Other(s.to_owned())),
-        }
+        Ok(match s.as_str() {
+            "audio" => CodecType::Audio,
+            "video" => CodecType::Video,
+            "subtitle" => CodecType::Subtitle,
+            _ => CodecType::Other(s),
+        })
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct Stream {
-    pub index: usize,
-    pub codec_long_name: String,
-    pub channels: Option<usize>,
+    index: usize,
+    channels: Option<usize>,
     /// `.mkv` does not store the duration in the streams; we have to use `format -> duration` instead
-    pub duration: Option<String>,
-    pub codec_type: CodecType,
+    duration: Option<String>,
+    codec_type: CodecType,
 }
 
 #[derive(Debug, Deserialize)]
 struct Format {
-    pub duration: Option<String>,
+    duration: Option<String>,
 }
 
 /// Metadata associated with a video.
@@ -54,122 +52,117 @@ struct Metadata {
     format: Option<Format>,
 }
 
-define_error!(DecoderError, DecoderErrorKind);
+/// Everything that can go wrong while getting audio samples out of a video file.
+#[derive(Debug, Error)]
+pub enum DecoderError {
+    #[error("failed to decode video stream info")]
+    FailedToDecodeVideoStreamInfo(#[source] std::str::Utf8Error),
 
-#[derive(Debug, Fail)]
-pub enum DecoderErrorKind {
-    FailedToDecodeVideoStreamInfo,
+    #[error(
+        "failed to extract metadata from '{}' using command '{}'",
+        file_path.display(),
+        format_cmd(cmd_path, args)
+    )]
     ExtractingMetadataFailed {
         cmd_path: PathBuf,
         file_path: PathBuf,
         args: Vec<OsString>,
+        #[source]
+        source: Box<DecoderError>,
     },
-    NoAudioStream {
-        path: PathBuf,
-    },
+
+    #[error("no audio stream in file '{}'", path.display())]
+    NoAudioStream { path: PathBuf },
+
+    #[error(
+        "failed to extract audio from '{}' with '{}'",
+        file_path.display(),
+        format_cmd(cmd_path, args)
+    )]
     FailedExtractingAudio {
         file_path: PathBuf,
         cmd_path: PathBuf,
         args: Vec<OsString>,
+        #[source]
+        source: Box<DecoderError>,
     },
+
+    #[error("failed to spawn subprocess '{}'", format_cmd(path, args))]
     FailedSpawningSubprocess {
         path: PathBuf,
         args: Vec<OsString>,
+        #[source]
+        source: std::io::Error,
     },
+
+    #[error("failed to check status of subprocess '{}'", cmd_path.display())]
     WaitingForProcessFailed {
         cmd_path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
+
+    #[error(
+        "process '{}' returned error code '{}'",
+        cmd_path.display(),
+        code.map_or_else(|| String::from("interrupted?"), |code| code.to_string())
+    )]
     ProcessErrorCode {
         cmd_path: PathBuf,
         code: Option<i32>,
+        /// the process' stderr, when it said anything at all
+        #[source]
+        source: Option<Box<DecoderError>>,
     },
-    ProcessErrorMessage {
-        msg: String,
-    },
+
+    #[error("stderr: {msg}")]
+    ProcessErrorMessage { msg: String },
+
+    #[error("failed to deserialize metadata of file '{}'", path.display())]
     DeserializingMetadataFailed {
         path: PathBuf,
+        #[source]
+        source: serde_json::Error,
     },
-    ReadError,
+
+    #[error("error while reading stdout")]
+    ReadError(#[source] std::io::Error),
+
+    #[error("failed to parse duration string '{s}' from metadata")]
     FailedToParseDuration {
         s: String,
+        #[source]
+        source: std::num::ParseFloatError,
     },
-    AudioSegmentProcessingFailed,
+
+    /// The cause is an [`AudioReceiver::Error`](super::AudioReceiver::Error), which in
+    /// practice has `DecoderError` somewhere in its own source chain - the box breaks
+    /// that type cycle.
+    #[error("processing audio segment failed")]
+    AudioSegmentProcessingFailed(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    #[error("no audio duration information found")]
     NoDurationInformation,
 }
 
-fn format_cmd(cmd_path: &PathBuf, args: &[OsString]) -> String {
-    let args_string: String = args
+fn format_cmd(cmd_path: &Path, args: &[OsString]) -> String {
+    let args = args
         .iter()
-        .map(|x| format!("{}", x.to_string_lossy()))
-        .collect::<Vec<String>>()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
         .join(" ");
-    format!("{} {}", cmd_path.display(), args_string)
+    format!("{} {}", cmd_path.display(), args)
 }
 
-impl fmt::Display for DecoderErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DecoderErrorKind::FailedToDecodeVideoStreamInfo => write!(f, "failed to decode video stream info"),
-            DecoderErrorKind::DeserializingMetadataFailed { path } => {
-                write!(f, "failed to deserialize metadata of file '{}'", path.display())
-            }
-            DecoderErrorKind::NoAudioStream { path } => write!(f, "no audio stream in file '{}'", path.display()),
-            DecoderErrorKind::FailedExtractingAudio {
-                file_path,
-                cmd_path,
-                args,
-            } => write!(
-                f,
-                "failed to extract audio from '{}' with '{}' ",
-                file_path.display(),
-                format_cmd(cmd_path, args)
-            ),
-            DecoderErrorKind::FailedSpawningSubprocess { path, args } => {
-                write!(f, "failed to spawn subprocess '{}' ", format_cmd(path, args))
-            }
-            DecoderErrorKind::WaitingForProcessFailed { cmd_path } => {
-                write!(f, "failed to check status of subprocess '{}'", cmd_path.display())
-            }
-            DecoderErrorKind::ProcessErrorCode { cmd_path, code } => write!(
-                f,
-                "process '{}' returned error code '{}'",
-                cmd_path.display(),
-                code.map(|x| x.to_string())
-                    .unwrap_or_else(|| String::from("interrupted?"))
-            ),
-            DecoderErrorKind::ProcessErrorMessage { msg } => write!(f, "stderr: {}", msg),
-            DecoderErrorKind::ExtractingMetadataFailed {
-                file_path,
-                cmd_path,
-                args,
-            } => write!(
-                f,
-                "failed to extract metadata from '{}' using command '{}'",
-                file_path.display(),
-                format_cmd(cmd_path, args)
-            ),
-            DecoderErrorKind::ReadError => write!(f, "error while reading stdout"),
-            DecoderErrorKind::FailedToParseDuration { s } => {
-                write!(f, "failed to parse duration string '{}' from metadata", s)
-            }
-            DecoderErrorKind::AudioSegmentProcessingFailed => write!(f, "processing audio segment failed"),
-            DecoderErrorKind::NoDurationInformation => write!(f, "no audio duration information found"),
-        }
-    }
-}
-
-trait IntoOk<T> {
-    fn into_ok<I>(self) -> Result<T, I>;
-}
-impl<T> IntoOk<T> for T {
-    fn into_ok<I>(self) -> Result<T, I> {
-        Ok(self)
-    }
-}
-
+/// Extracts the audio of a video file with the `ffmpeg` command line tool.
+#[derive(Debug)]
 pub struct VideoDecoderFFmpegBinary {}
 
-static PROGRESS_PRESCALER: i64 = 200;
+/// How many samples one step of the progress bar stands for.
+const PROGRESS_PRESCALER: i64 = 200;
+
+/// The samples are read from the pipe in blocks of this size.
+const READ_BUFFER_SIZE: usize = 1024 * 1024;
 
 impl VideoDecoderFFmpegBinary {
     /// Samples are pushed in 8kHz mono/single-channel format.
@@ -179,58 +172,51 @@ impl VideoDecoderFFmpegBinary {
         receiver: impl super::AudioReceiver<Output = T>,
         mut progress_handler: impl super::ProgressHandler,
     ) -> Result<T, DecoderError> {
-        let file_path_buf: PathBuf = file_path.as_ref().into();
+        let file_path = file_path.as_ref();
 
-        let args = vec![
+        let ffprobe_args = vec![
             OsString::from("-v"),
             OsString::from("error"),
             OsString::from("-show_entries"),
-            OsString::from("format=duration:stream=index,codec_long_name,channels,duration,codec_type"),
+            OsString::from("format=duration:stream=index,channels,duration,codec_type"),
             OsString::from("-of"),
             OsString::from("json"),
-            OsString::from(file_path.as_ref()),
+            OsString::from(file_path),
         ];
 
         let ffprobe_path: PathBuf = std::env::var_os("ALASS_FFPROBE_PATH")
-            .unwrap_or(OsString::from("ffprobe"))
+            .unwrap_or_else(|| OsString::from("ffprobe"))
             .into();
 
-        let metadata: Metadata =
-            Self::get_metadata(file_path_buf.clone(), ffprobe_path.clone(), &args).with_context(|_| {
-                DecoderErrorKind::ExtractingMetadataFailed {
-                    file_path: file_path_buf.clone(),
-                    cmd_path: ffprobe_path.clone(),
-                    args: args,
-                }
-            })?;
+        let metadata: Metadata = Self::get_metadata(file_path, &ffprobe_path, &ffprobe_args).map_err(|source| {
+            DecoderError::ExtractingMetadataFailed {
+                cmd_path: ffprobe_path,
+                file_path: file_path.to_path_buf(),
+                args: ffprobe_args,
+                source: Box::new(source),
+            }
+        })?;
 
         let mut audio_streams = metadata
             .streams
             .into_iter()
-            .filter(|s| s.codec_type == CodecType::Audio && s.channels.is_some());
+            .filter(|stream| stream.codec_type == CodecType::Audio && stream.channels.is_some());
 
-        let best_stream_opt = match audio_index {
-            None => audio_streams
-                .min_by_key(|s| s.channels.unwrap()),
-            Some(ai) => audio_streams
-                .find(|s| s.index == ai)
+        let best_stream = match audio_index {
+            None => audio_streams.min_by_key(|stream| stream.channels.unwrap()),
+            Some(audio_index) => audio_streams.find(|stream| stream.index == audio_index),
+        };
+        let Some(best_stream) = best_stream else {
+            return Err(DecoderError::NoAudioStream {
+                path: file_path.to_path_buf(),
+            });
         };
 
-        let best_stream: Stream;
-        match best_stream_opt {
-            Some(x) => best_stream = x,
-            None => {
-                return Err(DecoderError::from(DecoderErrorKind::NoAudioStream {
-                    path: file_path.as_ref().into(),
-                }))
-            }
-        }
-
         let ffmpeg_path: PathBuf = std::env::var_os("ALASS_FFMPEG_PATH")
-            .unwrap_or(OsString::from("ffmpeg"))
+            .unwrap_or_else(|| OsString::from("ffmpeg"))
             .into();
 
-        let args: Vec<OsString> = vec![
+        let ffmpeg_args: Vec<OsString> = vec![
             // only print errors
             OsString::from("-v"),
             OsString::from("error"),
@@ -238,7 +224,7 @@ impl VideoDecoderFFmpegBinary {
             OsString::from("-y"),
             // input file
             OsString::from("-i"),
-            file_path.as_ref().into(),
+            file_path.into(),
             // select stream
             OsString::from("-map"),
             format!("0:{}", best_stream.index).into(),
@@ -258,186 +244,164 @@ impl VideoDecoderFFmpegBinary {
             OsString::from("-"),
         ];
 
-        let format_opt: Option<Format> = metadata.format;
-
         // `.mkv` containers do not store duration info in streams, only the format information does contain it
         let duration_str = best_stream
             .duration
-            .or_else(|| format_opt.and_then(|format| format.duration))
-            .ok_or_else(|| DecoderError::from(DecoderErrorKind::NoDurationInformation))?;
+            .or_else(|| metadata.format.and_then(|format| format.duration))
+            .ok_or(DecoderError::NoDurationInformation)?;
 
         let duration = duration_str
             .parse::<f64>()
-            .with_context(|_| DecoderErrorKind::FailedToParseDuration { s: duration_str })?;
+            .map_err(|source| DecoderError::FailedToParseDuration {
+                s: duration_str,
+                source,
+            })?;
 
-        let num_samples: i64 = (duration * 8000.0) as i64 / PROGRESS_PRESCALER;
+        progress_handler.init((duration * 8000.0) as i64 / PROGRESS_PRESCALER);
 
-        progress_handler.init(num_samples);
-
-        return Self::extract_audio_stream(receiver, progress_handler, ffmpeg_path.clone(), &args)
-            .with_context(|_| DecoderErrorKind::FailedExtractingAudio {
-                file_path: file_path_buf.clone(),
-                cmd_path: ffmpeg_path.clone(),
-                args: args,
-            })?
-            .into_ok();
+        Self::extract_audio_stream(receiver, progress_handler, &ffmpeg_path, &ffmpeg_args).map_err(|source| {
+            DecoderError::FailedExtractingAudio {
+                file_path: file_path.to_path_buf(),
+                cmd_path: ffmpeg_path,
+                args: ffmpeg_args,
+                source: Box::new(source),
+            }
+        })
     }
 
     fn extract_audio_stream<T>(
         mut receiver: impl super::AudioReceiver<Output = T>,
         mut progress_handler: impl super::ProgressHandler,
-        ffmpeg_path: PathBuf,
+        ffmpeg_path: &Path,
         args: &[OsString],
     ) -> Result<T, DecoderError> {
-        let mut ffmpeg_process: Child = Command::new(ffmpeg_path.clone())
+        let mut ffmpeg_process: Child = Command::new(ffmpeg_path)
             .args(args)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .with_context(|_| DecoderErrorKind::FailedSpawningSubprocess {
-                path: ffmpeg_path.clone(),
+            .map_err(|source| DecoderError::FailedSpawningSubprocess {
+                path: ffmpeg_path.to_path_buf(),
                 args: args.to_vec(),
+                source,
             })?;
 
-        let mut stdout: ChildStdout = ffmpeg_process.stdout.take().unwrap();
+        let mut stdout: ChildStdout = ffmpeg_process.stdout.take().expect("stdout was piped");
 
-        enum ParserState {
-            Start,
-            SingleByte(u8),
-        }
-
-        let mut data: Vec<u8> = std::vec::from_elem(0, 200 * 1024 * 1024);
-        let data2_cap = 1024 * 1024;
-        let mut data2: Vec<i16> = Vec::with_capacity(data2_cap);
-        let mut parser_state: ParserState = ParserState::Start;
+        let mut raw = vec![0u8; READ_BUFFER_SIZE];
+        let mut samples: Vec<i16> = Vec::with_capacity(READ_BUFFER_SIZE / 2);
+        // a read can end in the middle of a sample, so the odd byte waits here
+        let mut half_sample: Option<u8> = None;
         let mut progress_prescaler_counter = 0;
 
         loop {
-            // improves performance by allowing ffmpeg to generate more data in pipe
-            // TODO: an async tokio read might also have the same effect (without being as machine dependent)
-            //  -> too low: does not do anything (+some otherhead)
-            //  -> too high: slows down computaton because ffmpeg has to wait for this process to read
-            //std::thread::sleep(Duration::from_nanos(1000));
-
-            let read_bytes = stdout.read(&mut data).with_context(|_| DecoderErrorKind::ReadError)?;
-            //println!("{}", read_bytes);
+            let read_bytes = stdout.read(&mut raw).map_err(DecoderError::ReadError)?;
 
             if read_bytes == 0 {
-                match ffmpeg_process
-                    .wait()
-                    .with_context(|_| DecoderErrorKind::WaitingForProcessFailed {
-                        cmd_path: ffmpeg_path.clone(),
-                    })?
-                    .code()
-                {
-                    Some(0) => {
-                        receiver
-                            .push_samples(&data2)
-                            .with_context(|_| DecoderErrorKind::AudioSegmentProcessingFailed)?;
-                        data2.clear();
-                        progress_handler.finish();
-                        return Ok(receiver
-                            .finish()
-                            .with_context(|_| DecoderErrorKind::AudioSegmentProcessingFailed)?);
-                    }
-                    code @ Some(_) | code @ None => {
-                        let error_code_err: DecoderErrorKind = DecoderErrorKind::ProcessErrorCode {
-                            cmd_path: ffmpeg_path,
-                            code: code,
-                        };
+                break;
+            }
 
-                        let mut stderr_data = Vec::new();
-                        ffmpeg_process
-                            .stderr
-                            .unwrap()
-                            .read_to_end(&mut stderr_data)
-                            .with_context(|_| DecoderErrorKind::ReadError)?;
+            let mut bytes = &raw[..read_bytes];
+            samples.clear();
 
-                        let stderr_str: String = String::from_utf8_lossy(&stderr_data).into();
-
-                        if stderr_str.is_empty() {
-                            return Err(error_code_err.into());
-                        } else {
-                            return Err(DecoderError::from(DecoderErrorKind::ProcessErrorMessage {
-                                msg: stderr_str,
-                            }))
-                            .with_context(|_| error_code_err)
-                            .map_err(|x| DecoderError::from(x));
-                        }
-                    }
+            if let Some(first_byte) = half_sample.take() {
+                if let Some((&second_byte, rest)) = bytes.split_first() {
+                    samples.push(i16::from_le_bytes([first_byte, second_byte]));
+                    bytes = rest;
+                } else {
+                    half_sample = Some(first_byte);
                 }
             }
 
-            for &byte in &data[0..read_bytes] {
-                match parser_state {
-                    ParserState::Start => parser_state = ParserState::SingleByte(byte),
-                    ParserState::SingleByte(last_byte) => {
-                        let two_bytes = [last_byte, byte];
-                        let sample = byteorder::LittleEndian::read_i16(&two_bytes);
-                        receiver
-                            .push_samples(&[sample])
-                            .with_context(|_| DecoderErrorKind::AudioSegmentProcessingFailed)?;
-
-                        if progress_prescaler_counter == PROGRESS_PRESCALER {
-                            progress_handler.inc();
-                            progress_prescaler_counter = 0;
-                        }
-
-                        progress_prescaler_counter = progress_prescaler_counter + 1;
-
-                        /*data2.push(sample);
-                        if data2.len() == data2_cap {
-                            receiver.push_samples(&data2);
-                            data2.clear();
-                        }*/
-                        parser_state = ParserState::Start;
-                    }
-                }
+            let mut sample_pairs = bytes.chunks_exact(2);
+            samples.extend(sample_pairs.by_ref().map(|pair| i16::from_le_bytes([pair[0], pair[1]])));
+            if let [last_byte] = *sample_pairs.remainder() {
+                half_sample = Some(last_byte);
             }
+
+            receiver
+                .push_samples(&samples)
+                .map_err(|source| DecoderError::AudioSegmentProcessingFailed(Box::new(source)))?;
+
+            progress_prescaler_counter += samples.len() as i64;
+            while progress_prescaler_counter >= PROGRESS_PRESCALER {
+                progress_handler.inc();
+                progress_prescaler_counter -= PROGRESS_PRESCALER;
+            }
+        }
+
+        let exit_code = ffmpeg_process
+            .wait()
+            .map_err(|source| DecoderError::WaitingForProcessFailed {
+                cmd_path: ffmpeg_path.to_path_buf(),
+                source,
+            })?
+            .code();
+
+        if exit_code != Some(0) {
+            return Err(Self::process_error(
+                ffmpeg_path,
+                exit_code,
+                ffmpeg_process.stderr.expect("stderr was piped"),
+            ));
+        }
+
+        progress_handler.finish();
+        receiver
+            .finish()
+            .map_err(|source| DecoderError::AudioSegmentProcessingFailed(Box::new(source)))
+    }
+
+    /// Reads whatever the process wrote to stderr and pairs it with its exit code.
+    fn process_error(cmd_path: &Path, code: Option<i32>, mut stderr: impl Read) -> DecoderError {
+        let mut stderr_data = Vec::new();
+        if let Err(source) = stderr.read_to_end(&mut stderr_data) {
+            return DecoderError::ReadError(source);
+        }
+
+        Self::process_error_from_stderr(cmd_path, code, &String::from_utf8_lossy(&stderr_data))
+    }
+
+    fn process_error_from_stderr(cmd_path: &Path, code: Option<i32>, stderr: &str) -> DecoderError {
+        DecoderError::ProcessErrorCode {
+            cmd_path: cmd_path.to_path_buf(),
+            code,
+            source: if stderr.is_empty() {
+                None
+            } else {
+                Some(Box::new(DecoderError::ProcessErrorMessage { msg: stderr.to_owned() }))
+            },
         }
     }
 
-    fn get_metadata(file_path: PathBuf, ffprobe_path: PathBuf, args: &[OsString]) -> Result<Metadata, DecoderError> {
-        let ffprobe_process: Output = Command::new(ffprobe_path.clone())
+    fn get_metadata(file_path: &Path, ffprobe_path: &Path, args: &[OsString]) -> Result<Metadata, DecoderError> {
+        let ffprobe_process: Output = Command::new(ffprobe_path)
             .args(args)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .output()
-            .with_context(|_| DecoderErrorKind::FailedSpawningSubprocess {
-                path: ffprobe_path.clone(),
+            .map_err(|source| DecoderError::FailedSpawningSubprocess {
+                path: ffprobe_path.to_path_buf(),
                 args: args.to_vec(),
+                source,
             })?;
 
         if !ffprobe_process.status.success() {
-            let stderr: String = String::from_utf8_lossy(&ffprobe_process.stderr)
-                .to_string()
-                .trim_end()
-                .to_string();
-
-            let err = DecoderErrorKind::ProcessErrorCode {
-                cmd_path: ffprobe_path.clone(),
-                code: ffprobe_process.status.code(),
-            };
-
-            if stderr.is_empty() {
-                return Err(DecoderError::from(err));
-            } else {
-                return Err(DecoderError::from(DecoderErrorKind::ProcessErrorMessage {
-                    msg: stderr,
-                }))
-                .with_context(|_| err)
-                .map_err(|x| DecoderError::from(x));
-            }
+            let stderr = String::from_utf8_lossy(&ffprobe_process.stderr);
+            return Err(Self::process_error_from_stderr(
+                ffprobe_path,
+                ffprobe_process.status.code(),
+                stderr.trim_end(),
+            ));
         }
 
-        let stdout =
-            from_utf8(&ffprobe_process.stdout).with_context(|_| DecoderErrorKind::FailedToDecodeVideoStreamInfo)?;
+        let stdout = from_utf8(&ffprobe_process.stdout).map_err(DecoderError::FailedToDecodeVideoStreamInfo)?;
 
-        let metadata: Metadata = serde_json::from_str(stdout)
-            .with_context(|_| DecoderErrorKind::DeserializingMetadataFailed { path: file_path })?;
-
-        Ok(metadata)
+        serde_json::from_str(stdout).map_err(|source| DecoderError::DeserializingMetadataFailed {
+            path: file_path.to_path_buf(),
+            source,
+        })
     }
 }

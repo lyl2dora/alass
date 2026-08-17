@@ -248,8 +248,8 @@ impl DifferentialRatingBufferBuilder {
         assert!(start < end);
 
         DifferentialRatingBufferBuilder {
-            start: start,
-            end: end,
+            start,
+            end,
             buffer: Vec::new(),
         }
     }
@@ -329,7 +329,7 @@ impl DifferentialRatingBuffer {
 
         RatingIterator::<_> {
             start: self.start,
-            iter: iter,
+            iter,
         }
     }
 }
@@ -474,10 +474,7 @@ where
     pub fn append(self, end_point: Point, data: D) -> SegmentIterator<D, impl SI<D>> {
         SegmentIterator::<D, _> {
             start: self.start,
-            iter: self.iter.chain(once(Segment::<D> {
-                end_point: end_point,
-                data: data,
-            })),
+            iter: self.iter.chain(once(Segment::<D> { end_point, data })),
         }
     }
 }
@@ -624,15 +621,21 @@ impl<T> PI for T where T: Iterator<Item = OffsetSegment> {}
 pub trait DI: Iterator<Item = DualSegment> {}
 impl<T> DI for T where T: Iterator<Item = DualSegment> {}
 
+// `SFI`/`RFI`/`PFI`/`DFI` are terse markers used throughout this dense module;
+// spelling them out (`Sfi`, ...) would only make the signatures harder to read.
+#[allow(clippy::upper_case_acronyms)]
 pub trait SFI<D>: Iterator<Item = FullSegment<D>> {}
 impl<T, D> SFI<D> for T where T: Iterator<Item = FullSegment<D>> {}
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait RFI: Iterator<Item = RatingFullSegment> {}
 impl<T> RFI for T where T: Iterator<Item = RatingFullSegment> {}
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait PFI: Iterator<Item = OffsetFullSegment> {}
 impl<T> PFI for T where T: Iterator<Item = OffsetFullSegment> {}
 
+#[allow(clippy::upper_case_acronyms)]
 pub trait DFI: Iterator<Item = DualFullSegment> {}
 impl<T> DFI for T where T: Iterator<Item = DualFullSegment> {}
 
@@ -663,11 +666,11 @@ impl<I: DI> DualIterator<I> {
             .expect("Second iterator should have at least one element");
 
         DualFullSegmentIterator::<_> {
-            start: start,
+            start,
             iter: RatingAdderIterator2::<_, _> {
                 segment_start: start,
-                dual_seg1: dual_seg1,
-                dual_seg2: dual_seg2,
+                dual_seg1,
+                dual_seg2,
                 input_iter1: self.iter,
                 input_iter2: iter2.iter,
                 finished: false,
@@ -783,7 +786,7 @@ impl<I: RI> RatingIterator<I> {
                     rating: Rating::zero(),
                     delta: RatingDelta::zero(),
                 }),
-                end_point: end_point,
+                end_point,
             },
         }
     }
@@ -904,7 +907,7 @@ impl<I: DFI> LeftToRightMaximumIterator<I> {
     #[inline]
     fn constant_segment(&self, span: PointSpan) -> DualFullSegment {
         DualFullSegment {
-            span: span,
+            span,
             data: self.constant_dual_info(),
         }
     }
@@ -915,18 +918,12 @@ impl<I: DFI> Iterator for LeftToRightMaximumIterator<I> {
 
     #[inline] // XXX: is this really faster?
     fn next(&mut self) -> Option<DualFullSegment> {
-        // TODO: rewrite when changing to 2018 edition
         if let Some(stored_segment) = self.stored_segment.take() {
             return Some(stored_segment);
         }
 
         // TODO: unify segments when possible
-        let segment: DualFullSegment;
-
-        match self.input_iter.next() {
-            None => return None,
-            Some(_segment) => segment = _segment,
-        }
+        let segment: DualFullSegment = self.input_iter.next()?;
 
         let segment_start_rating = segment.start_rating();
         let segment_end_rating = segment.end_rating();
@@ -935,18 +932,18 @@ impl<I: DFI> Iterator for LeftToRightMaximumIterator<I> {
         let end_offset = segment.data.offset_info.end_offset(segment.span.len());
 
         if segment_start_rating <= self.current_best_rating && segment_end_rating <= self.current_best_rating {
-            return Some(self.constant_segment(segment.span));
+            Some(self.constant_segment(segment.span))
         } else if segment_start_rating >= self.current_best_rating {
             if segment_start_rating >= segment_end_rating {
                 self.current_best_rating = segment_start_rating;
                 self.current_best_timepoint = start_offset;
 
-                return Some(self.constant_segment(segment.span));
+                Some(self.constant_segment(segment.span))
             } else {
                 self.current_best_rating = segment_end_rating;
                 self.current_best_timepoint = end_offset;
 
-                return Some(segment);
+                Some(segment)
             }
         } else {
             /* implicit:
@@ -988,7 +985,7 @@ impl<I: DFI> Iterator for LeftToRightMaximumIterator<I> {
             };
 
             self.stored_segment = Some(segment2);
-            return Some(segment1);
+            Some(segment1)
         }
     }
 }
@@ -1038,14 +1035,13 @@ impl OffsetBuffer {
 
     #[inline]
     pub fn end_offset(&self) -> Offset {
-        assert!(self.buffer.len() > 0);
+        assert!(!self.buffer.is_empty());
 
-        let segment_start: Point;
-        if self.buffer.len() == 1 {
-            segment_start = self.start;
+        let segment_start: Point = if self.buffer.len() == 1 {
+            self.start
         } else {
-            segment_start = self.buffer[self.buffer.len() - 2].end_point;
-        }
+            self.buffer[self.buffer.len() - 2].end_point
+        };
 
         let last_segment = *self.buffer.last().unwrap();
         last_segment.data.end_offset(last_segment.end_point - segment_start)
@@ -1346,12 +1342,12 @@ pub fn combined_maximum_of_dual_iterators<I1: DI, I2: DI>(
         .expect("Second iterator should have at least one element");
 
     DualFullSegmentIterator::<_> {
-        start: start,
+        start,
         iter: CombinedMaximumDualIterator::<_, _> {
             stored_segment: None,
             segment_start: start,
-            dual_seg1: dual_seg1,
-            dual_seg2: dual_seg2,
+            dual_seg1,
+            dual_seg2,
             input_iter1: iter1.iter,
             input_iter2: iter2.iter,
             finished: false,
@@ -1798,11 +1794,11 @@ impl<I: PushIterator<Item = RatingFullSegment>> AggressiveSimplifyRatingPushIter
             max_diff,
         );
 
-        return Self::intersect_intervals(interval1, interval2);
+        Self::intersect_intervals(interval1, interval2)
     }
 
     fn intersect_intervals(a: Interval, b: Interval) -> Interval {
-        return (f64::max(a.0, b.0), f64::min(a.1, b.1));
+        (f64::max(a.0, b.0), f64::min(a.1, b.1))
     }
 
     fn create_segment(&self, seg: RatingFullSegment) -> AggressiveSimplifySegmentData {
@@ -1810,8 +1806,8 @@ impl<I: PushIterator<Item = RatingFullSegment>> AggressiveSimplifyRatingPushIter
         let pivot_rating = seg.data.get_at(pivot - seg.span.start);
 
         AggressiveSimplifySegmentData {
-            seg: seg,
-            pivot: pivot,
+            seg,
+            pivot,
             offset_interval: Self::get_min_max_offset_for_segment(seg, pivot_rating, pivot, self.epsilon),
         }
     }
@@ -1831,16 +1827,11 @@ impl<I: PushIterator<Item = RatingFullSegment>> PushIterator for AggressiveSimpl
 
     #[inline]
     fn push(&mut self, next_segment: RatingSegment) {
-        let mut current_segment: AggressiveSimplifySegmentData;
-
-        match self.current_segment.take() {
-            None => {
-                let seg = next_segment.with_start_point(self.start);
-                self.current_segment = Some(self.create_segment(seg));
-                return;
-            }
-            Some(v) => current_segment = v,
-        }
+        let Some(mut current_segment) = self.current_segment.take() else {
+            let seg = next_segment.with_start_point(self.start);
+            self.current_segment = Some(self.create_segment(seg));
+            return;
+        };
 
         let seg = next_segment.with_start_point(current_segment.seg.span.end);
 
@@ -1882,9 +1873,9 @@ where
 {
     AggressiveSimplifyRatingPushIterator {
         current_segment: None,
-        epsilon: epsilon,
-        start: start,
-        iter: iter,
+        epsilon,
+        start,
+        iter,
     }
 }
 
@@ -1910,15 +1901,10 @@ impl<I: PushIterator<Item = OffsetFullSegment>> PushIterator for SimplifyOffsetP
 
     #[inline]
     fn push(&mut self, next_segment: OffsetSegment) {
-        let mut current_segment: OffsetFullSegment;
-
-        match self.current_segment {
-            None => {
-                self.current_segment = Some(next_segment.with_start_point(self.start));
-                return;
-            }
-            Some(v) => current_segment = v,
-        }
+        let Some(mut current_segment) = self.current_segment else {
+            self.current_segment = Some(next_segment.with_start_point(self.start));
+            return;
+        };
 
         if current_segment.data.drag == next_segment.data.drag
             && current_segment.exclusive_end_offset() == next_segment.data.start_offset()
@@ -1941,8 +1927,8 @@ where
 {
     SimplifyOffsetPushIterator {
         current_segment: None,
-        start: start,
-        iter: iter,
+        start,
+        iter,
     }
 }
 
@@ -1968,15 +1954,10 @@ impl<I: PushIterator<Item = RatingFullSegment>> PushIterator for SimplifyRatingP
 
     #[inline]
     fn push(&mut self, next_segment: RatingSegment) {
-        let mut current_segment: RatingFullSegment;
-
-        match self.current_segment {
-            None => {
-                self.current_segment = Some(next_segment.with_start_point(self.start));
-                return;
-            }
-            Some(v) => current_segment = v,
-        }
+        let Some(mut current_segment) = self.current_segment else {
+            self.current_segment = Some(next_segment.with_start_point(self.start));
+            return;
+        };
 
         if current_segment.data.delta == next_segment.data.delta
             && current_segment.exclusive_end_rating() == next_segment.data.start_rating()
@@ -1997,8 +1978,8 @@ where
 {
     SimplifyRatingPushIterator {
         current_segment: None,
-        start: start,
-        iter: iter,
+        start,
+        iter,
     }
 }
 
@@ -2109,8 +2090,8 @@ where
     I: PushIterator<Item = B>,
 {
     MapPushIterator {
-        iter: iter,
-        f: f,
+        iter,
+        f,
         _marker: Default::default(),
     }
 }
@@ -2156,14 +2137,7 @@ impl<I: DI> Iterator for DualSimplifyIterator<I> {
 
     #[inline]
     fn next(&mut self) -> Option<DualFullSegment> {
-        let mut current_segment: DualFullSegment;
-
-        match self.current_segment.take() {
-            None => {
-                return None;
-            }
-            Some(v) => current_segment = v,
-        }
+        let mut current_segment: DualFullSegment = self.current_segment.take()?;
 
         loop {
             match self.iter.next() {

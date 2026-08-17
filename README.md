@@ -18,16 +18,45 @@ are documented in my [bachelor's thesis](documentation/thesis.pdf)
 and summarized in my [bachelor's presentation](documentation/slides.pdf).
 
 
-## Executable for Windows (64-bit)
+## Executables
 
-Get the latest executable from [here](https://github.com/kaegi/alass/releases)! Just download and extract the archive. The file `alass.bat` is the command line tool.
+Grab one from the [releases page](https://github.com/lyl2dora/alass/releases), or build it
+yourself with the commands in [Building the release binaries](#building-the-release-binaries).
+Releases are cut by running the `build` workflow with a tag in its `release_tag` input, so every
+published binary comes from a run that passed the tests and the end-to-end smoke test on its own
+platform.
 
-## Executable for Linux (64-bit)
+| Platform | Artifact |
+| --- | --- |
+| Windows x86-64 | `alass-windows64.exe` |
+| Linux x86-64 | `alass-linux64` (statically linked, runs on any distribution) |
+| Linux ARM64 | `alass-linux-arm64` (likewise) |
+| macOS Apple Silicon | `alass-macos-arm64.tar.gz` |
 
-Get the latest executable from [here](https://github.com/kaegi/alass/releases)! To run the executable, `ffmpeg` and
-`ffprobe` have to be installed.
-You can change their paths with the environment variables
-`ALASS_FFMPEG_PATH` (default `ffmpeg`) and `ALASS_FFPROBE_PATH` (default `ffprobe`). 
+Upstream's [2019 releases](https://github.com/kaegi/alass/releases) predate everything in this
+fork - including a fix for `.idx` output, which used to abort the program.
+
+To read video files, `ffmpeg` and `ffprobe` have to be installed. You can change their paths with
+the environment variables `ALASS_FFMPEG_PATH` (default `ffmpeg`) and `ALASS_FFPROBE_PATH`
+(default `ffprobe`).
+
+### On macOS
+
+Extract the archive and install `ffmpeg`:
+
+```bash
+$ tar -xzf alass-macos-arm64.tar.gz
+$ brew install ffmpeg # provides both `ffmpeg` and `ffprobe`
+$ ./alass-macos/alass movie.mp4 incorrect_subtitle.srt output.srt
+```
+
+The binary is not signed or notarized, so macOS puts a downloaded archive in quarantine and
+refuses to start it ("cannot be opened because the developer cannot be verified"). Removing
+the quarantine flag once is enough:
+
+```bash
+$ xattr -d com.apple.quarantine ./alass-macos/alass
+```
 
 ## Usage
 
@@ -52,14 +81,15 @@ $ alass reference_subtitle.ssa incorrect_subtitle.srt output.srt --split-penalty
 
 Values between 5 and 20 are the most useful. Anything above 20 misses some important splits and anything below 5 introduces many unnecessary splits.
 
-If you only want to shift the subtitle, without introducing splits, you can use `--no-splits`:
+If you only want to shift the subtitle, without introducing splits, you can use `--no-split`:
 
 ```bash
 # synchronizing the subtitles in this mode is very fast
-$ alass movie.mp4 incorrect_subtitle.srt output.srt --no-splits
+$ alass movie.mp4 incorrect_subtitle.srt output.srt --no-split
 ```
 
-Currently supported are `.srt`, `.ssa`/`.ass` and `.idx` files. Every common video format is supported for the reference file.
+Currently supported are `.srt`, `.ssa`/`.ass`, `.idx` and `.sub` files (MicroDVD, and VobSub as a
+reference). Every common video format is supported for the reference file.
 
 
 ## Performance and Results
@@ -83,65 +113,100 @@ compared to a (possibly not perfect) reference subtitle.
 
 ## How to compile the binary
 
-Install [Rust and Cargo](https://www.rust-lang.org/en-US/install.html) then run:
-
-```bash
-# this will create the lastest release in ~/.cargo/bin/alass-cli
-$ cargo install alass-cli
-```
-
-
-The voice-activity module this project uses is written in C. Therefore a C compiler (`gcc` or `clang`) is needed to compile this project.
-
-To use `alass-cli` with video files, `ffmpeg` and `ffprobe` have to be installed. It is used to extract the raw audio data. You can set the paths used by `alass` using the environment variables `ALASS_FFMPEG_PATH` (default `ffmpeg`) and `ALASS_FFPROBE_PATH` (default `ffprobe`). 
-
-### Building from Source 
-
-If you want to build and run the project from source code:
+This fork is not published on crates.io - `cargo install alass-cli` would fetch the 2019
+release instead, so build it from source:
 
 ```bash
 $ git clone https://github.com/kaegi/alass
 $ cd alass
-$ cargo build
-$ cargo run -- movie.mp4 input.srt output.srt
+$ cargo build --release
+$ cargo run --release -- movie.mp4 input.srt output.srt
 ```
 
-### Configuration
+It needs [Rust](https://www.rust-lang.org/tools/install) 1.88 or newer (the workspace is on
+edition 2024); `rust-toolchain.toml` points rustup at the stable channel. The voice activity
+module is written in C, so a C compiler (`gcc` or `clang`) has to be available too.
 
-All parameters are shown for `cargo build` can also be used for `cargo install` and `cargo run`.
+To use `alass-cli` with video files, `ffmpeg` and `ffprobe` have to be installed. They are
+used to extract the raw audio data. You can set the paths used by `alass` using the
+environment variables `ALASS_FFMPEG_PATH` (default `ffmpeg`) and `ALASS_FFPROBE_PATH`
+(default `ffprobe`).
 
-#### FFmpeg as a library
+### Building the release binaries
 
-You can also link `ffmpeg` as a dynamic library during compile time. The library implementation can extract the audio about 2 to 3 seconds faster. Unfortunately it is harder to compile, the error handling is only very basic and might still have bugs.
+| Platform | Rust target | Command | Output |
+| --- | --- | --- | --- |
+| Windows x86-64 | `x86_64-pc-windows-msvc` | `cargo build --release` | `target/release/alass-cli.exe` |
+| Linux x86-64 | `x86_64-unknown-linux-musl` | `make package_linux64` | `target/alass-linux64` |
+| Linux ARM64 | `aarch64-unknown-linux-musl` | `make package_linux_arm64` | `target/alass-linux-arm64` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `make package_macos` | `target/alass-macos-arm64`, `target/alass-macos-arm64.tar.gz` |
 
-You have to remove "`# FFMPEG-LIB`" from every line that starts with it in `alass-cli/Cargo.toml`. Then use:
+The Linux binaries are statically linked against musl, so they run on any distribution;
+building them needs `musl-gcc` (`apt install musl-tools`) and the matching Rust target
+(`rustup target add ...`). Both Linux targets are built natively, i.e. on a machine or
+container of their own architecture.
+
+The same four binaries are built by the `build` GitHub Actions workflow. It is triggered
+manually ("Run workflow" in the *Actions* tab, optionally for a single platform), runs
+`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and the smoke test on every
+platform, and uploads the binaries as workflow artifacts. Filling in its `release_tag` input
+additionally publishes them, with a `SHA256SUMS`, as a GitHub Release under that tag.
+
+### Smoke test
+
+`scripts/smoke-test.sh` aligns a subtitle that was shifted by a known offset - once against a
+reference subtitle and once against a video file generated with `ffmpeg` - and checks that the
+offset was recovered:
 
 ```bash
-# Important: you have to be inside `alass-cli`! Otherwise the parameters get ignored.
-$ cargo build --no-default-features --features ffmpeg-library
+$ cargo build --release
+$ make smoke_test
 ```
+
+### FFmpeg as a library
+
+By default `alass` spawns the `ffmpeg` and `ffprobe` executables to read the audio out of a
+video file, which is what the released binaries do and needs nothing at build time. It can
+instead link against the FFmpeg libraries, which extracts the audio a few seconds faster:
+
+```bash
+$ cargo build --release -p alass-cli --no-default-features --features ffmpeg-library
+```
+
+That needs the FFmpeg development packages and `pkg-config` at compile time
+(`brew install ffmpeg pkg-config`, or `libavcodec-dev libavformat-dev libavutil-dev
+libavfilter-dev libavdevice-dev libswresample-dev libswscale-dev` on Debian/Ubuntu), so it
+does not work for the statically linked musl builds. The `build` workflow can check this
+feature on Linux and macOS - tick "ffmpeg_library" when starting it.
 
 
 ### Alias Setup
 
-*For Linux users:* It is recommended to add the folder path to your system path as well as setup an alias for `alass` to `alass-cli`. Add this to your `~/.bashrc` (or the setup file of your favorite shell):
+*For Linux and macOS users:* the binary is called `alass-cli` when built from source, so it is
+worth putting it on your path under the shorter name. Add this to your `~/.bashrc` (or the setup
+file of your favorite shell), pointing it at wherever you keep the binary:
 
 ```bash
-export PATH="$PATH:$HOME/.cargo/bin"
+export PATH="$PATH:$HOME/.local/bin"
 alias alass="alass-cli"
 ```
 
 ## Folder structure
 
-This `cargo` workspace contains two projects:
+This `cargo` workspace contains three crates:
 
   - `alass-core` which provides the algorithm
-  
+
     It is targeted at *developers* who want to use the same algorithm in their project.
 
   - `alass-cli` which is the official command line tool
 
     It is target at *end users* who want to correct their subtitles.
+
+  - `alass-subparse` which reads and writes the subtitle files
+
+    A vendored fork of [`subparse`](https://github.com/kaegi/subparse) 0.7.0 (MPL-2.0),
+    modernized in place - see `alass-subparse/README.md` for what changed and why.
 
 ## Library Documentation
 

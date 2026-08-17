@@ -1,0 +1,21 @@
+[package]
+name = "alass-subparse"
+version = "0.8.0"
+description = "Load, change and write common subtitle formats (srt/ass/idx/sub) - vendored, modernized fork of kaegi/subparse 0.7.0"
+license = "MPL-2.0"
+keywords = ["subtitle", "parse", "library", "write"]
+categories = ["parser-implementations", "multimedia"]
+readme = "README.md"
+publish = false
+
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+chardetng.workspace = true
+encoding_rs.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
