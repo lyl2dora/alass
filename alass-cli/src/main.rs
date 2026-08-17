@@ -28,7 +28,7 @@ extern crate subparse;
 
 use crate::subparse::SubtitleFileInterface;
 
-use alass_core::{align, TimeDelta as AlgTimeDelta};
+use alass_core::{align, get_nosplit_score, standard_scoring, TimeDelta as AlgTimeDelta};
 use clap::{App, Arg};
 use encoding_rs::Encoding;
 use failure::ResultExt;
@@ -58,6 +58,26 @@ fn unpack_clap_number_f64(
             .into()
         })
         .map_err(|e| InputArgumentsError::from(e))
+}
+
+/// Does reading, parsing and nice error handling for an optional f64 clap parameter.
+fn unpack_optional_clap_number_f64(
+    matches: &clap::ArgMatches,
+    parameter_name: &'static str,
+) -> Result<Option<f64>, InputArgumentsError> {
+    match matches.value_of(parameter_name) {
+        None => Ok(None),
+        Some(parameter_value_str) => f64::from_str(parameter_value_str)
+            .with_context(|_| {
+                InputArgumentsErrorKind::ArgumentParseError {
+                    argument_name: parameter_name.to_string(),
+                    value: parameter_value_str.to_string(),
+                }
+                .into()
+            })
+            .map(Some)
+            .map_err(|e| InputArgumentsError::from(e)),
+    }
 }
 
 /// Does reading, parsing and nice error handling for a f64 clap parameter.
@@ -142,6 +162,9 @@ struct Arguments {
     speed_optimization: Option<f64>,
 
     audio_index: Option<usize>,
+
+    /// if set, exit with a non-zero code when the alignment score falls below this value
+    min_score: Option<f64>,
 }
 
 fn parse_args() -> Result<Arguments, InputArgumentsError> {
@@ -225,6 +248,11 @@ fn parse_args() -> Result<Arguments, InputArgumentsError> {
             .value_name("audio-index")
             .required(false)
         )
+        .arg(Arg::with_name("min-score")
+            .long("min-score")
+            .value_name("score between 0 and 1")
+            .required(false)
+            .help("Exit with code 2 if the alignment score is below this value; the output file is still written, so it can be inspected. The score is always printed, with or without this option. Pick a threshold by running a few files you trust first - the attainable score depends on how similarly the two files split their lines. Note that the score measures overlap and the algorithm maximizes overlap, so it reliably catches a result that found nothing to match, but not one that matched the wrong thing; check the reported shift range for that."))
         .after_help("This program works with .srt, .ass/.ssa, .idx and .sub files. The corrected file will have the same format as the incorrect file.")
         .get_matches();
 
@@ -281,7 +309,22 @@ fn parse_args() -> Result<Arguments, InputArgumentsError> {
         } else {
             Some(speed_optimization)
         },
-        audio_index: unpack_optional_clap_number_usize(&matches, "audio-index")?
+        audio_index: unpack_optional_clap_number_usize(&matches, "audio-index")?,
+        min_score: {
+            let min_score = unpack_optional_clap_number_f64(&matches, "min-score")?;
+            if let Some(value) = min_score {
+                if value < 0.0 || value > 1.0 {
+                    return Err(InputArgumentsErrorKind::ValueNotInRange {
+                        argument_name: "min-score".to_string(),
+                        value,
+                        min: 0.0,
+                        max: 1.0,
+                    }
+                    .into());
+                }
+            }
+            min_score
+        },
     })
 }
 
@@ -307,7 +350,9 @@ fn prepare_reference_file(args: &Arguments) -> Result<InputFileHandler, failure:
 
 // //////////////////////////////////////////////////////////////////////////////////////////////////
 
-fn run() -> Result<(), failure::Error> {
+/// Returns the process exit code: 0 on success, 2 when the alignment score is
+/// below the `--min-score` threshold requested by the user.
+fn run() -> Result<i32, failure::Error> {
     let args = parse_args()?;
 
     if args.incorrect_file_path.eq(OsStr::new("_")) {
@@ -335,7 +380,7 @@ fn run() -> Result<(), failure::Error> {
             debug_file.to_data().unwrap(), // error handling
         )?;
 
-        return Ok(());
+        return Ok(0);
     }
 
     // open incorrect file before reference file before so that incorrect-file-not-found-errors are not displayed after the long audio extraction
@@ -423,6 +468,27 @@ fn run() -> Result<(), failure::Error> {
     }
     let deltas = alg_deltas_to_timing_deltas(&alg_deltas, args.interval);
 
+    // How well does the result actually match the reference? This is the plain overlap
+    // rating of the aligned spans; it deliberately leaves out the split penalty, so the
+    // number stays comparable between runs that used a different `--split-penalty`.
+    //
+    // `align_with_splits` notes that a single span can contribute at most 1 to the
+    // rating, so `min(ref_len, in_len)` is the highest attainable total - dividing by it
+    // puts the score on a 0 to 1 scale.
+    let max_attainable_rating = std::cmp::min(ref_aligner_timespans.len(), inc_aligner_timespans.len());
+    let alignment_score: f64 = if max_attainable_rating == 0 {
+        0.0
+    } else {
+        get_nosplit_score(
+            ref_aligner_timespans.iter().cloned(),
+            inc_aligner_timespans
+                .iter()
+                .zip(alg_deltas.iter())
+                .map(|(&timespan, &delta)| timespan + delta),
+            standard_scoring,
+        ) / max_attainable_rating as f64
+    };
+
     // group subtitles lines which have the same offset
     let shift_groups: Vec<(AlgTimeDelta, Vec<TimeSpan>)> = get_subtitle_delta_groups(
         alg_deltas
@@ -431,6 +497,8 @@ fn run() -> Result<(), failure::Error> {
             .zip(inc_file.timespans().iter().cloned())
             .collect(),
     );
+
+    let block_count = shift_groups.len();
 
     for (shift_group_delta, shift_group_lines) in shift_groups {
         // computes the first and last timestamp for all lines with that delta
@@ -455,6 +523,21 @@ fn run() -> Result<(), failure::Error> {
         );
     }
 
+    println!();
+    println!("alignment score: {:.3} (0 = no overlap, 1 = perfect overlap)", alignment_score);
+
+    // The score above measures overlap, and the algorithm picks its result by maximizing
+    // overlap - so a result that is wrong *because* it chased overlap still scores well.
+    // The spread between the smallest and largest shift is an independent signal: it is
+    // bounded by how much the two versions really differ, which the user usually knows.
+    if let (Some(&min_delta), Some(&max_delta)) = (alg_deltas.iter().min(), alg_deltas.iter().max()) {
+        println!(
+            "shift range: {} to {} across {} block(s)",
+            alg_delta_to_delta(min_delta, args.interval),
+            alg_delta_to_delta(max_delta, args.interval),
+            block_count
+        );
+    }
     println!();
 
     if ref_file.timespans().is_empty() {
@@ -527,14 +610,27 @@ fn run() -> Result<(), failure::Error> {
             .with_context(|_| TopLevelErrorKind::FailedToGenerateSubtitleData)?,
     )?;
 
-    Ok(())
+    // The file is written either way - a low score means "check this one", not "throw it
+    // away" - so the caller is told through the exit code instead.
+    if let Some(min_score) = args.min_score {
+        if alignment_score < min_score {
+            println!(
+                "warn: alignment score {:.3} is below the requested minimum of {:.3}",
+                alignment_score, min_score
+            );
+            println!("warn: the output file was still written, so the result can be inspected");
+            return Ok(2);
+        }
+    }
+
+    Ok(0)
 }
 
 // //////////////////////////////////////////////////////////////////////////////////////////////////
 
 fn main() {
     match run() {
-        Ok(_) => std::process::exit(0),
+        Ok(exit_code) => std::process::exit(exit_code),
         Err(error) => {
             print_error_chain(error);
             std::process::exit(1)
